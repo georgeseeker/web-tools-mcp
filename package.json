@@ -1,0 +1,21 @@
+{
+  "name": "web-tools-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP server exposing web_search (Bing) and web_fetch (Readability) over stdio",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^29.1.1",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}

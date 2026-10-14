@@ -194,3 +194,8 @@ test/fixtures/      Bing 响应样本与合成页面
 - Node.js ≥ 20，已在 Node 25.2.1 / Windows 11 上通过全部 136 项测试
 - jsdom 固定在 `^29.1.1`：jsdom 30 的 engines 为 `^22.22.2 || ^24.15.0 || >=26.0.0`，不含 Node 25
 - 跨平台（Windows / Linux / macOS）
+
+## 许可
+
+MIT
+

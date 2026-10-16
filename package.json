@@ -2,15 +2,14 @@
   "name": "web-tools-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "MCP server exposing web_search (Bing) and web_fetch (Readability) over stdio",
+  "description": "MCP server exposing web_search (Brave Search API) and web_fetch (Readability) over stdio",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "start": "node src/server.mjs",
-    "test": "node test/smoke.mjs"
+    "start": "node src/server.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

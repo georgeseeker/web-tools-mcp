@@ -1,8 +1,4 @@
-// web_fetch: retrieve one URL and hand back readable content.
-//
-// HTML goes through jsdom -> Readability -> Turndown (the same shape as the
-// official mcp-server-fetch). Scripts are never executed and subresources are
-// never loaded. Fetched content is untrusted data: this module only returns it.
+// Extract readable Markdown from fetched pages with Readability and Turndown.
 
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
@@ -20,16 +16,13 @@ const turndown = new TurndownService({
   hr: '---',
 });
 turndown.use(gfm);
-// Drop images: their URLs are usually noise and alt text alone is rarely useful.
 turndown.addRule('dropImages', { filter: 'img', replacement: () => '' });
-// Keep links but degrade empty ones to their text.
 turndown.addRule('emptyLinks', {
   filter: (node) => node.nodeName === 'A' && !node.getAttribute('href'),
   replacement: (content) => content,
 });
 
-// Turndown 7.x ships no rule that drops <script>/<style>, so their text would be
-// emitted as literal Markdown. Belt and braces: the DOM is pre-stripped too.
+// Remove scripts, styles and interactive markup from Markdown output.
 turndown.remove([
   'script',
   'style',
@@ -50,7 +43,6 @@ turndown.remove([
   'head',
 ]);
 
-/** Classify a Content-Type header into the branch we take. */
 export function classifyContentType(contentType) {
   const ct = String(contentType ?? '').toLowerCase().split(';')[0].trim();
   if (ct === 'text/html' || ct === 'application/xhtml+xml' || ct === '') return 'html';
@@ -69,11 +61,9 @@ export function classifyContentType(contentType) {
   return 'binary';
 }
 
-// Never article content, in either extraction path.
 const HARD_STRIP =
   'script,style,noscript,template,svg,canvas,iframe,object,embed,form,input,button,select,textarea,link,meta';
-// Chrome that is legitimate inside some articles, so only removed on the
-// body fallback where Readability's link-density scoring is not available.
+// Remove page navigation when falling back to the full body.
 const SOFT_STRIP = 'nav,header,footer,aside,[role="navigation"],[aria-hidden="true"]';
 
 function stripAll(root, selector) {
@@ -93,11 +83,7 @@ const ABSOLUTE_ATTRS = [
   ['audio[src]', 'src'],
 ];
 
-/**
- * Rewrite relative URLs against the page URL.
- * Readability does this for the links inside the article it extracts, but the
- * body fallback hands us untouched markup.
- */
+/** Resolve relative URLs in the body fallback. */
 export function absolutize(root, baseUrl) {
   for (const [selector, attr] of ABSOLUTE_ATTRS) {
     let nodes;
@@ -118,10 +104,7 @@ export function absolutize(root, baseUrl) {
   }
 }
 
-/**
- * Convert an HTML document to Markdown.
- * Returns { markdown, title, via } where via is 'readability' or 'body'.
- */
+/** Convert HTML to { markdown, title, via: 'readability' | 'body' }. */
 export function htmlToMarkdown(html, url) {
   const dom = new JSDOM(html, { url });
   try {
@@ -134,7 +117,7 @@ export function htmlToMarkdown(html, url) {
     let via = 'readability';
     let articleTitle = '';
     try {
-      // Readability mutates the document as it scores, so give it a clone.
+      // Readability mutates its input document.
       const article = new Readability(document.cloneNode(true)).parse();
       if (article && typeof article.content === 'string' && article.content.trim().length > 0) {
         content = article.content;
@@ -149,16 +132,13 @@ export function htmlToMarkdown(html, url) {
       const body = document.body;
       if (!body) return { markdown: '', title, via };
       stripAll(body, SOFT_STRIP);
-      // Readability only rewrites links inside its own article, so the fallback
-      // needs the relative URLs resolved explicitly.
       absolutize(body, url);
       content = body.innerHTML;
     }
 
     return finish(content, articleTitle || title, via);
   } finally {
-    // jsdom holds timers and listeners on the window; without close() a
-    // long-lived MCP server accumulates them on every fetch.
+    // Release jsdom timers and listeners.
     try {
       dom.window.close();
     } catch {
@@ -186,10 +166,7 @@ export function paginate(text, startIndex, maxLength) {
   return { slice: text.slice(start, end), start, end, total, hasMore: end < total, remaining: total - end };
 }
 
-/**
- * Fetch one URL and return a formatted result.
- * Throws HttpError with a specific code for every failure mode.
- */
+/** Fetch and extract one page, with optional raw output and pagination. */
 export async function fetchPage(rawUrl, options = {}) {
   const maxLength = options.maxLength ?? DEFAULT_MAX_LENGTH;
   const startIndex = options.startIndex ?? 0;
@@ -280,7 +257,6 @@ export function formatFetchedPage(result) {
       `\n\n--- truncated: ${page.remaining} characters remain. ` +
       `Call web_fetch again with start_index=${page.end} to continue. ---`;
   } else if (page.total > 0 && page.start >= page.total) {
-    // Over-paginated: say so plainly rather than returning a bare empty body.
     footer = `\n\n--- No more content available. This page is ${page.total} characters long. ---`;
   }
 

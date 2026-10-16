@@ -1,248 +1,127 @@
-// web_search: query Bing and parse the result list.
-//
-// No API key, no cookies, no login. Two decoders:
-//
-//   1. Bing's RSS endpoint (?format=rss) is the primary path. It has a stable
-//      schema, returns real unwrapped URLs and includes <pubDate>. Nothing about
-//      it depends on Bing's CSS class names, so a markup redesign cannot break it.
-//   2. The HTML endpoint (li.b_algo) is the fallback, for the day RSS disappears.
-//
-// Both endpoints behave the same way and neither is documented:
-//   * They return about 10 results per request regardless of `count`.
-//   * `first` (the paging offset) is accepted but ignored, so there is no paging.
-//     That is why this tool exposes no page parameter.
-// The paid Bing Search API is a separate surface with its own documented limits.
-//
-// The other rule that matters: a *blocked* response must never be mistaken for
-// "no results".
-
+// Web search through Brave Search API.
 import { HttpError, decodeBytes, htmlToText, httpGet } from './http.mjs';
 
 export const DEFAULT_COUNT = 8;
-export const MAX_COUNT = 10; // Bing returns about this many per request
-
-// Bing's own properties show up as anchors on every result page; they are noise.
-const NOISE_URL = /(^|\.)(bing\.com|microsoft\.com|microsofttranslator\.com|msn\.com)$/i;
-
-/**
- * Signals that the response is an anti-bot / consent / error page rather than a
- * result list. Only consulted when zero results were parsed, so a legitimate
- * page that happens to contain one of these words is unaffected.
- */
-const BLOCK_SIGNALS = [
-  ['captcha', 'a CAPTCHA challenge'],
-  ['unusual traffic', 'an "unusual traffic" notice'],
-  ['anomaly detected', 'an "anomaly detected" notice'],
-  ['challenge-form', 'a challenge form'],
-  ['verify you are a human', 'a human-verification prompt'],
-  ['before you continue to bing', 'a cookie/consent interstitial'],
-  ['accept all cookies', 'a cookie/consent interstitial'],
-];
-
-export function detectBlock(html, status) {
-  if (status === 429) return 'HTTP 429 — Bing is rate limiting this IP.';
-  if (status >= 500) return `HTTP ${status} from Bing (server-side error).`;
-  const lower = String(html ?? '').toLowerCase();
-  for (const [needle, label] of BLOCK_SIGNALS) {
-    if (lower.includes(needle)) return `Bing returned ${label} (matched "${needle}").`;
-  }
-  return null;
-}
-
-/** True when Bing explicitly says the query has no results (not a block). */
-export function looksLikeNoResults(body) {
-  const lower = String(body ?? '').toLowerCase();
-  return lower.includes('there are no results for') || lower.includes('no results found for');
-}
-
-/**
- * Turn a Bing result href into the real target URL.
- * With the HTML endpoint some results are wrapped in
- * https://www.bing.com/ck/a?...&u=a1<base64url>. Unwrap those; drop anything
- * that is not a plain http(s) URL we can hand back to the caller.
- */
-export function normalizeResultUrl(href) {
-  const raw = htmlToText(href);
-  if (!raw) return null;
-  if (/^https?:\/\/(www\.)?bing\.com\/ck\/a\?/i.test(raw)) {
-    const m = /[?&]u=a1([A-Za-z0-9_-]+)/.exec(raw);
-    if (!m) return null;
-    const b64 = m[1].replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(m[1].length / 4) * 4, '=');
-    try {
-      const real = Buffer.from(b64, 'base64').toString('utf8');
-      return /^https?:\/\//i.test(real) ? real : null;
-    } catch {
-      return null;
-    }
-  }
-  if (!/^https?:\/\//i.test(raw)) return null;
-  return raw;
-}
-
-function pushResult(list, seen, { title, url, snippet, published }) {
-  const cleanTitle = htmlToText(title);
-  if (!cleanTitle || cleanTitle.length < 2) return;
-  const href = normalizeResultUrl(url);
-  if (!href) return;
-  try {
-    if (NOISE_URL.test(new URL(href).hostname)) return;
-  } catch {
-    return;
-  }
-  const key = href.replace(/#.*$/, '');
-  if (seen.has(key)) return;
-  seen.add(key);
-  const entry = { title: cleanTitle, url: href, snippet: htmlToText(snippet).slice(0, 300) };
-  if (published) entry.published = String(published).trim();
-  list.push(entry);
-}
-
-/** Primary decoder: Bing's RSS 2.0 output. */
-export function parseBingRss(xml) {
-  const list = [];
-  const seen = new Set();
-  // Split on <item> rather than counting <link>: a channel and an image also
-  // carry <link> tags, so the counts do not line up.
-  for (const item of String(xml ?? '').split(/<item>/i).slice(1)) {
-    const title = /<title>([\s\S]*?)<\/title>/i.exec(item)?.[1];
-    const link = /<link>([\s\S]*?)<\/link>/i.exec(item)?.[1];
-    const description = /<description>([\s\S]*?)<\/description>/i.exec(item)?.[1];
-    const pubDate = /<pubDate>([\s\S]*?)<\/pubDate>/i.exec(item)?.[1];
-    pushResult(list, seen, { title, url: link, snippet: description, published: pubDate });
-  }
-  return { results: list, strategy: list.length > 0 ? 'rss' : 'rss-empty' };
-}
-
-/** Fallback decoder: the <li class="b_algo"> blocks of the HTML result page. */
-function parseAlgoBlocks(html, list, seen) {
-  // Split on the opening tag with a lookahead rather than matching to the first
-  // </li>: b_algo blocks can contain nested <ul>/<li> sitelink lists.
-  const blocks = String(html ?? '').split(/(?=<li[^>]*class="[^"]*\bb_algo\b)/i).slice(1);
-  for (const block of blocks) {
-    const anchor = /<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(block);
-    if (!anchor) continue;
-    const snippet =
-      /class="b_caption"[^>]*>[\s\S]{0,300}?<p[^>]*>([\s\S]*?)<\/p>/i.exec(block)?.[1] ??
-      /<p[^>]*>([\s\S]*?)<\/p>/i.exec(block)?.[1] ??
-      /<cite[^>]*>([\s\S]*?)<\/cite>/i.exec(block)?.[1];
-    pushResult(list, seen, { title: anchor[2], url: anchor[1], snippet });
-  }
-}
-
-/** Last resort: any external anchor with a plausible title. */
-function parseGenericAnchors(html, list, seen) {
-  const anchorRe = /<a[^>]*href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-  let match;
-  while ((match = anchorRe.exec(html)) !== null) {
-    if (htmlToText(match[2]).length < 15) continue;
-    pushResult(list, seen, { title: match[2], url: match[1], snippet: '' });
-  }
-}
-
-/** Parse a Bing HTML result page. */
-export function parseBingResults(html) {
-  const list = [];
-  const seen = new Set();
-  parseAlgoBlocks(html, list, seen);
-  if (list.length === 0) parseGenericAnchors(html, list, seen);
-  return { results: list, strategy: list.length > 0 ? 'b_algo' : 'anchors' };
-}
-
-export function buildSearchUrl(query, { count = DEFAULT_COUNT, rss = false } = {}) {
-  const url = new URL('https://www.bing.com/search');
-  url.searchParams.set('q', query);
-  url.searchParams.set('count', String(count));
-  // Bing's zh-CN market backend mis-segments multi-word Chinese queries: "机器学习 入门"
-  // comes back with dictionary entries for the single character 机器. ensearch=1 selects
-  // the global backend, which segments correctly. The locale parameters (setlang, setmkt,
-  // mkt, cc) have no effect on this.
-  url.searchParams.set('ensearch', '1');
-  if (rss) url.searchParams.set('format', 'rss');
-  return url.href;
-}
+export const MAX_COUNT = 20;
+const ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
 
 const clampCount = (n) => Math.min(MAX_COUNT, Math.max(1, Number.isFinite(n) ? Math.floor(n) : DEFAULT_COUNT));
 
-/**
- * Run a search. Returns { results, strategy, note } or throws HttpError with a
- * code explaining exactly why it failed.
- */
-export async function searchBing(query, options = {}) {
-  const count = clampCount(options.count);
-  const notes = [];
-
-  // ---- Primary: RSS -------------------------------------------------------
-  let rssError = null;
-  try {
-    const res = await httpGet(buildSearchUrl(query, { count, rss: true }), {
-      timeoutMs: options.timeoutMs,
-      throttleMs: 800,
-    });
-    if (res.status >= 200 && res.status < 400) {
-      if (/consent\.bing\.com/i.test(new URL(res.finalUrl).hostname)) {
-        throw new HttpError('SEARCH_CONSENT_WALL', 'Bing redirected to a consent page.');
-      }
-      const xml = decodeBytes(res.bytes, res.charset);
-      const { results } = parseBingRss(xml);
-      if (results.length > 0) {
-        if (count > results.length) {
-          notes.push(`Bing returns at most ${results.length} results per query; \`count\` above that has no effect.`);
-        }
-        return { results: results.slice(0, count), strategy: 'rss', note: notes.join(' ') || null };
-      }
-      rssError = detectBlock(xml, res.status);
-    } else {
-      rssError = detectBlock('', res.status);
-    }
-  } catch (err) {
-    if (err instanceof HttpError && err.code === 'SEARCH_CONSENT_WALL') throw err;
-    rssError = err instanceof Error ? err.message : String(err);
-  }
-
-  // ---- Fallback: HTML -----------------------------------------------------
-  const res = await httpGet(buildSearchUrl(query, { count }), {
-    timeoutMs: options.timeoutMs,
-    throttleMs: 800,
-  });
-
-  if (res.status < 200 || res.status >= 400) {
-    const block = detectBlock('', res.status);
-    throw new HttpError('SEARCH_HTTP', block ?? `Bing returned HTTP ${res.status} ${res.statusText}.`, {
-      status: res.status,
-      url: res.finalUrl,
-    });
-  }
-
-  const html = decodeBytes(res.bytes, res.charset);
-  const { results, strategy } = parseBingResults(html);
-
-  if (results.length === 0) {
-    const block = detectBlock(html, res.status);
-    if (block) {
-      throw new HttpError('SEARCH_BLOCKED', `${block} This is not an empty result set.`, {
-        url: res.finalUrl,
-        status: res.status,
-      });
-    }
-    if (looksLikeNoResults(html)) {
-      return { results: [], strategy, note: 'Bing reports no results for this query.' };
-    }
-    throw new HttpError(
-      'SEARCH_UNPARSEABLE',
-      `Bing returned HTTP 200 but neither the RSS nor the HTML decoder found any results${rssError ? ` (RSS: ${rssError})` : ''}, ` +
-        'and no anti-bot signal was present. Bing may have changed its output — the decoder needs updating.',
-      { url: res.finalUrl, status: res.status },
-    );
-  }
-
-  if (strategy !== 'b_algo') notes.push('parsed via the anchor fallback');
-  if (rssError) notes.push(`RSS path failed (${rssError}); fell back to HTML`);
-  return { results: results.slice(0, count), strategy, note: notes.join(' ') || null };
+export function buildSearchUrl(query, { count = DEFAULT_COUNT, search_lang, country = 'ALL', freshness } = {}) {
+  const url = new URL(ENDPOINT);
+  url.searchParams.set('q', query);
+  url.searchParams.set('count', String(clampCount(count)));
+  url.searchParams.set('country', country);
+  // Brave uses zh-hans and zh-hant for Chinese.
+  const chinese = /\p{Script=Han}/u.test(query) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(query);
+  url.searchParams.set('search_lang', search_lang || (chinese ? 'zh-hans' : 'en'));
+  url.searchParams.set('result_filter', 'web');
+  url.searchParams.set('text_decorations', 'false');
+  url.searchParams.set('spellcheck', 'false');
+  if (freshness) url.searchParams.set('freshness', freshness);
+  return url.href;
 }
 
-/** Human-readable rendering for the tool result. */
-export function formatSearchResults(query, { results, strategy, note }, { count }) {
-  const lines = [`Search: ${query}`, `Source: Bing (${strategy})  requested=${count}`];
+/** Parse and deduplicate web results in provider order. */
+export function parseBraveResults(data) {
+  if (!data || Array.isArray(data) || typeof data !== 'object' ||
+      data.type !== 'search' || !data.query || typeof data.query.original !== 'string' ||
+      (data.web != null && !Array.isArray(data.web.results))) {
+    throw new HttpError('SEARCH_UNPARSEABLE', 'Brave returned an unexpected search response.');
+  }
+
+  const items = data.web?.results ?? [];
+  const results = [];
+  const seen = new Set();
+  for (const item of items) {
+    if (!item || typeof item.title !== 'string' || typeof item.url !== 'string') continue;
+    let url;
+    try { url = new URL(item.url); } catch { continue; }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) continue;
+    const title = htmlToText(item.title);
+    if (!title) continue;
+    const key = new URL(url.href);
+    key.hash = '';
+    if (seen.has(key.href)) continue;
+    seen.add(key.href);
+    const result = {
+      title,
+      url: url.href,
+      snippet: typeof item.description === 'string' ? htmlToText(item.description).slice(0, 1000) : '',
+    };
+    // page_age is a publication or modification date.
+    if (typeof item.page_age === 'string' && item.page_age.trim()) result.date = item.page_age.trim();
+    results.push(result);
+  }
+  if (items.length > 0 && results.length === 0) {
+    throw new HttpError('SEARCH_UNPARSEABLE', 'Brave returned web results, but none contained a usable title and URL.');
+  }
+
+  const notes = [];
+  if (data.query.altered && data.query.altered !== data.query.original) {
+    notes.push(`Brave used an altered query: ${htmlToText(String(data.query.altered))}`);
+  }
+  if (data.query.bad_results === true) notes.push('Brave flagged these results as low quality; refine the query.');
+  if (results.length === 0) notes.push('Brave returned no web results for this query.');
+  return { results, note: notes.join(' ') || null };
+}
+
+function apiError(status, data) {
+  const providerCode = typeof data?.error?.code === 'string' ? data.error.code : '';
+  const detail = typeof data?.error?.detail === 'string' ? htmlToText(data.error.detail).slice(0, 400) : '';
+  if (status === 401 || status === 403 || /SUBSCRIPTION|TOKEN_INVALID|TOKEN_EXPIRED/.test(providerCode)) {
+    return new HttpError('SEARCH_AUTH', 'Brave rejected the API key or subscription. Check BRAVE_SEARCH_API_KEY and the active Search plan.');
+  }
+  if (providerCode === 'QUOTA_LIMITED') {
+    return new HttpError('SEARCH_QUOTA_EXCEEDED', 'Brave Search API quota is exhausted. Check usage and limits in the Brave dashboard.');
+  }
+  if (status === 429 || providerCode === 'RATE_LIMITED') {
+    return new HttpError('SEARCH_RATE_LIMITED', 'Brave Search API rate limit reached. Wait before trying again.');
+  }
+  return new HttpError('SEARCH_HTTP', `Brave Search API returned HTTP ${status}${providerCode ? ` (${providerCode})` : ''}${detail ? `: ${detail}` : '.'}`);
+}
+
+export async function searchBrave(query, options = {}) {
+  if (typeof query !== 'string' || !query.trim()) throw new HttpError('BAD_QUERY', 'query must be a non-empty string.');
+  const apiKey = process.env.BRAVE_SEARCH_API_KEY?.trim();
+  if (!apiKey) {
+    throw new HttpError('MISSING_API_KEY', 'Set BRAVE_SEARCH_API_KEY in the MCP server environment to use Brave Search. web_fetch does not require a key.');
+  }
+  if (/[^\x21-\x7e]/.test(apiKey)) {
+    throw new HttpError('SEARCH_AUTH', 'BRAVE_SEARCH_API_KEY must be a single ASCII token without whitespace or control characters.');
+  }
+  try {
+    const res = await httpGet(buildSearchUrl(query.trim(), options), {
+      timeoutMs: options.timeoutMs,
+      throttleMs: 1000,
+      followRedirects: false,
+      headers: {
+        Accept: 'application/json',
+        'X-Subscription-Token': apiKey,
+        'User-Agent': 'web-tools-mcp/0.1.0',
+      },
+    });
+    if (res.truncated) throw new HttpError('SEARCH_UNPARSEABLE', 'Brave response exceeded the download size limit.');
+    let data;
+    try { data = JSON.parse(decodeBytes(res.bytes, res.charset)); } catch {
+      if (res.status >= 200 && res.status < 300) {
+        throw new HttpError('SEARCH_UNPARSEABLE', 'Brave returned a successful HTTP status with invalid JSON.');
+      }
+    }
+    if (res.status < 200 || res.status >= 300 || data?.error || data?.type === 'ErrorResponse') {
+      throw apiError(res.status, data);
+    }
+    const parsed = parseBraveResults(data);
+    return { ...parsed, results: parsed.results.slice(0, clampCount(options.count)) };
+  } catch (err) {
+    // Redact API credentials from error messages.
+    const message = String(err?.message ?? err).split(apiKey).join('[redacted]');
+    throw new HttpError(err instanceof HttpError ? err.code : 'SEARCH_FAILED', message);
+  }
+}
+
+export function formatSearchResults(query, { results, note }, { count }) {
+  const lines = [`Search: ${query}`, `Source: Brave Search API  requested=${count}`];
   if (note) lines.push(`Note: ${note}`);
   lines.push('');
   if (results.length === 0) {
@@ -250,12 +129,10 @@ export function formatSearchResults(query, { results, strategy, note }, { count 
     return lines.join('\n');
   }
   results.forEach((r, i) => {
-    lines.push(`${i + 1}. ${r.title}`);
-    lines.push(`   ${r.url}`);
+    lines.push(`${i + 1}. ${r.title}`, `   ${r.url}`);
     if (r.snippet) lines.push(`   ${r.snippet}`);
-    if (r.published) lines.push(`   published: ${r.published}`);
+    if (r.date) lines.push(`   date (published or updated): ${r.date}`);
     lines.push('');
   });
-  lines.push('Note: results are steered by this machine\'s network exit location; there is no paging.');
   return lines.join('\n').trimEnd();
 }

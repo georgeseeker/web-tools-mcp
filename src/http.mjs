@@ -293,6 +293,80 @@ export function robotsAllowsPath(rules, pathname) {
   return best === null ? true : best.allow;
 }
 
+// ---------------------------------------------------------------------------
+// Transport failure classification
+//
+// undici reports every transport failure as TypeError('fetch failed') and hides
+// the real socket error in `cause`. Reporting the wrapper verbatim tells the
+// caller nothing about whether the host was unresolvable, refused, firewalled
+// or merely slow, so unwrap it into a code plus a message.
+// ---------------------------------------------------------------------------
+
+const DNS_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN']);
+const CONNECT_TIMEOUT_CODES = new Set([
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+const CONNECT_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EADDRNOTAVAIL',
+  'EPIPE',
+  'UND_ERR_SOCKET',
+]);
+
+/** The most specific message available: the cause's, else the wrapper's. */
+function causeMessage(err) {
+  const cause = err?.cause;
+  if (typeof cause?.message === 'string' && cause.message.trim()) return cause.message.trim();
+  if (typeof err?.message === 'string' && err.message.trim()) return err.message.trim();
+  return String(err);
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url);
+  }
+}
+
+/**
+ * Classify a fetch() rejection into an HttpError shape.
+ * Returns null for errors the caller already handles itself — an abort raised
+ * by our own timeout controller — so the caller can report those its own way.
+ */
+export function classifyFetchError(err, url) {
+  if (err?.name === 'AbortError' || err?.name === 'TimeoutError') return null;
+
+  const code = err?.cause?.code ?? err?.code;
+  const host = hostOf(url);
+  const detail = causeMessage(err);
+
+  if (DNS_CODES.has(code)) {
+    return { code: 'DNS_FAILURE', message: `Could not resolve ${host} (${code}).` };
+  }
+  if (CONNECT_TIMEOUT_CODES.has(code)) {
+    return {
+      code: 'CONNECT_TIMEOUT',
+      message:
+        `Timed out connecting to ${host} (${code}). The host did not accept a ` +
+        `connection in time — it may be unreachable from this network or blocked by a firewall. ${detail}`,
+    };
+  }
+  if (CONNECT_CODES.has(code)) {
+    return { code: 'CONNECTION_FAILED', message: `Connection to ${host} failed (${code}). ${detail}` };
+  }
+  return {
+    code: 'REQUEST_FAILED',
+    message: `Request to ${host} failed${code ? ` (${code})` : ''}: ${detail}`,
+  };
+}
+
 /** Whether the caller's robots policy permits fetching this URL. Fails open. */
 export async function robotsAllows(rawUrl) {
   if (!RESPECT_ROBOTS) return true;
@@ -426,20 +500,14 @@ export async function httpGet(rawUrl, options = {}) {
             url: current,
           });
         }
-        const cause = err?.cause?.code ?? err?.code;
-        if (cause === 'ENOTFOUND' || cause === 'EAI_AGAIN') {
-          throw new HttpError('DNS_FAILURE', `Could not resolve host for ${current}`, {
+        const failure = classifyFetchError(err, current);
+        // classifyFetchError returns null only for the aborts handled just above.
+        if (!failure) {
+          throw new HttpError('REQUEST_FAILED', `Request failed: ${err?.message ?? String(err)}`, {
             url: current,
           });
         }
-        if (cause === 'ECONNREFUSED' || cause === 'ECONNRESET' || cause === 'EHOSTUNREACH') {
-          throw new HttpError('CONNECTION_FAILED', `Connection failed (${cause}) for ${current}`, {
-            url: current,
-          });
-        }
-        throw new HttpError('REQUEST_FAILED', `Request failed: ${err?.message ?? String(err)}`, {
-          url: current,
-        });
+        throw new HttpError(failure.code, failure.message, { url: current });
       }
 
       if (!REDIRECT_STATUS.has(response.status)) break;

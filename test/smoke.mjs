@@ -21,6 +21,7 @@ import {
   isPrivateHost,
   parseRobotsTxt,
   robotsAllowsPath,
+  classifyFetchError,
 } from '../src/http.mjs';
 import {
   parseBingRss,
@@ -115,6 +116,46 @@ section('robots.txt parsing (opt-in)');
   check('allow overrides disallow', robotsAllowsPath(rules, '/private/ok') === true);
   check('unlisted path allowed', robotsAllowsPath(rules, '/public') === true);
   check('empty rules allow everything', robotsAllowsPath([], '/anything') === true);
+}
+
+section('transport failure classification');
+{
+  // undici's shape: TypeError('fetch failed') with the real socket error in cause.
+  const failure = (code, message = 'socket detail') =>
+    Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(message), { code }) });
+  const url = 'https://blocked.example/x';
+  const classify = (err) => classifyFetchError(err, url);
+
+  check('ENOTFOUND is a DNS failure', classify(failure('ENOTFOUND')).code === 'DNS_FAILURE');
+  check('EAI_AGAIN is a DNS failure', classify(failure('EAI_AGAIN')).code === 'DNS_FAILURE');
+  check(
+    'UND_ERR_CONNECT_TIMEOUT is a connect timeout',
+    classify(failure('UND_ERR_CONNECT_TIMEOUT')).code === 'CONNECT_TIMEOUT',
+    JSON.stringify(classify(failure('UND_ERR_CONNECT_TIMEOUT'))),
+  );
+  check('ETIMEDOUT is a connect timeout', classify(failure('ETIMEDOUT')).code === 'CONNECT_TIMEOUT');
+  check('headers timeout is a connect timeout', classify(failure('UND_ERR_HEADERS_TIMEOUT')).code === 'CONNECT_TIMEOUT');
+  check('ECONNREFUSED is a connection failure', classify(failure('ECONNREFUSED')).code === 'CONNECTION_FAILED');
+  check('UND_ERR_SOCKET is a connection failure', classify(failure('UND_ERR_SOCKET')).code === 'CONNECTION_FAILED');
+
+  // The regression this section exists for: an unmapped code used to surface the
+  // bare wrapper text "fetch failed", which says nothing about the real cause.
+  const unmapped = classify(failure('EWEIRD', 'kernel said no'));
+  check('unmapped code is REQUEST_FAILED', unmapped.code === 'REQUEST_FAILED', unmapped.code);
+  check('unmapped code still reports the real cause', /kernel said no/.test(unmapped.message), unmapped.message);
+  check('wrapper text alone is never the message', !/^Request to .* failed: fetch failed$/.test(unmapped.message), unmapped.message);
+
+  check('connect timeout message names the host', /blocked\.example/.test(classify(failure('UND_ERR_CONNECT_TIMEOUT')).message));
+  check('no cause falls back to the wrapper message', /some other problem/.test(
+    classify(new TypeError('some other problem')).message,
+  ));
+  check('unparseable url still classifies', classifyFetchError(failure('ECONNREFUSED'), 'not a url').code === 'CONNECTION_FAILED');
+
+  // Aborts raised by our own timeout controller are the caller's to report.
+  const abort = Object.assign(new Error('aborted'), { name: 'AbortError' });
+  const timeout = Object.assign(new Error('timed out'), { name: 'TimeoutError' });
+  check('AbortError is left to the caller', classifyFetchError(abort, url) === null);
+  check('TimeoutError is left to the caller', classifyFetchError(timeout, url) === null);
 }
 
 section('content-type classification');

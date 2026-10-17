@@ -387,6 +387,22 @@ async function readCapped(response, maxBytes) {
   return { bytes: out, truncated };
 }
 
+/** One fetch, with the shared network-failure classification. */
+async function fetchOnce(url, init, start) {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    if (err?.name === 'AbortError' || err?.name === 'TimeoutError') {
+      throw new HttpError('TIMEOUT', `Request timed out after ${Date.now() - start}ms`, { url });
+    }
+    const failure = classifyFetchError(err, url);
+    if (!failure) {
+      throw new HttpError('REQUEST_FAILED', `Request failed: ${err?.message ?? String(err)}`, { url });
+    }
+    throw new HttpError(failure.code, failure.message, { url });
+  }
+}
+
 /** GET a URL with bounded redirects, timeout and download size. */
 export async function httpGet(rawUrl, options = {}) {
   const {
@@ -433,8 +449,9 @@ export async function httpGet(rawUrl, options = {}) {
 
       await throttle(throttleMs);
 
-      try {
-        response = await fetch(current, {
+      response = await fetchOnce(
+        current,
+        {
           redirect: 'manual',
           signal: controller.signal,
           headers: {
@@ -444,21 +461,9 @@ export async function httpGet(rawUrl, options = {}) {
             'Accept-Encoding': 'gzip, deflate, br',
             ...headers,
           },
-        });
-      } catch (err) {
-        if (err?.name === 'AbortError' || err?.name === 'TimeoutError') {
-          throw new HttpError('TIMEOUT', `Request timed out after ${Date.now() - start}ms`, {
-            url: current,
-          });
-        }
-        const failure = classifyFetchError(err, current);
-        if (!failure) {
-          throw new HttpError('REQUEST_FAILED', `Request failed: ${err?.message ?? String(err)}`, {
-            url: current,
-          });
-        }
-        throw new HttpError(failure.code, failure.message, { url: current });
-      }
+        },
+        start,
+      );
 
       if (!REDIRECT_STATUS.has(response.status) || !followRedirects) break;
 
@@ -490,6 +495,65 @@ export async function httpGet(rawUrl, options = {}) {
       finalUrl: current,
       contentType,
       charset,
+      bytes,
+      truncated,
+      elapsedMs: Date.now() - start,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** POST a JSON body and read a capped response. For API calls, so no redirects. */
+export async function httpPost(rawUrl, body, options = {}) {
+  const {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    maxBytes = MAX_BYTES,
+    headers = {},
+    throttleMs = 0,
+  } = options;
+
+  const start = Date.now();
+  const url = parseUrl(rawUrl);
+  if (!ALLOW_PRIVATE && isPrivateHost(url.hostname)) {
+    throw new HttpError(
+      'PRIVATE_ADDRESS',
+      `Refusing to POST to the private/loopback address ${url.host}. ` +
+        'Set WEB_TOOLS_ALLOW_PRIVATE=1 to allow local addresses.',
+      { url: url.href },
+    );
+  }
+
+  await throttle(throttleMs);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetchOnce(
+      url.href,
+      {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream, application/json',
+          ...headers,
+        },
+        body: JSON.stringify(body),
+      },
+      start,
+    );
+
+    const { bytes, truncated } = await readCapped(response, maxBytes);
+    const contentType = response.headers.get('content-type') ?? '';
+
+    return {
+      status: response.status,
+      statusText: response.statusText,
+      contentType,
+      charset: sniffCharset(contentType, bytes),
       bytes,
       truncated,
       elapsedMs: Date.now() - start,

@@ -1,7 +1,7 @@
 // Web search through Brave Search API.
 import { HttpError, decodeBytes, htmlToText, httpGet } from './http.mjs';
 
-export const DEFAULT_COUNT = 8;
+export const DEFAULT_COUNT = 5;
 export const MAX_COUNT = 20;
 const ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
 

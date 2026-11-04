@@ -49,7 +49,8 @@ const TOOLS = [
   {
     name: 'web_fetch',
     description: [
-      'Fetch one URL and return it as readable Markdown, with navigation, ads and scripts stripped. JavaScript is not executed, so script-rendered pages come back thin.',
+      'Fetch one URL and return it as readable Markdown, with navigation, ads and scripts stripped.',
+      'JavaScript is not executed, so script-rendered pages come back thin. Login, paywall and bot-challenge pages are reported as errors (LOGIN_REQUIRED / BLOCKED) instead of being returned as content — use the playwright tools for those.',
       'Text, JSON and XML are returned as-is; binary content (images, PDFs, archives) is refused with an explanation.',
       'Long documents are paginated: call again with start_index to continue reading.',
     ].join('\n'),

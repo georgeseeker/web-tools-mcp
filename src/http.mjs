@@ -1,5 +1,9 @@
 // HTTP requests with redirects, size limits, charset decoding and throttling.
 
+import { lookup as dnsLookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
+import { Agent, fetch } from 'undici';
+
 export const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -52,30 +56,161 @@ export function parseUrl(rawUrl) {
 
 const ALLOW_PRIVATE = process.env.WEB_TOOLS_ALLOW_PRIVATE === '1';
 
-export function isPrivateHost(hostname) {
-  const host = String(hostname ?? '').replace(/^\[|\]$/g, '').toLowerCase();
-  if (!host) return false;
-  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
-
-  if (host.includes(':')) {
-    if (host === '::1' || host === '::') return true;
-    if (/^f[cd][0-9a-f]{2}:/.test(host)) return true; // fc00::/7 unique-local
-    if (/^fe[89ab][0-9a-f]:/.test(host)) return true; // fe80::/10 link-local
-    const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(host);
-    return mapped ? isPrivateHost(mapped[1]) : false;
-  }
-
+function isPrivateIPv4(host) {
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
   if (!m) return false;
-  const a = Number(m[1]);
-  const b = Number(m[2]);
-  if (m.slice(1).some((part) => Number(part) > 255)) return false;
+  const parts = m.slice(1).map(Number);
+  if (parts.some((part) => part > 255)) return false;
+  const [a, b] = parts;
   if (a === 0 || a === 10 || a === 127) return true;
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
   if (a === 169 && b === 254) return true; // link-local, includes cloud metadata
   if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
   return false;
+}
+
+/** Expand an IPv6 literal to eight 16-bit words, or null if malformed. */
+function expandIPv6(input) {
+  let host = String(input ?? '').toLowerCase();
+  const zone = host.indexOf('%');
+  if (zone !== -1) host = host.slice(0, zone); // strip the fe80::1%eth0 scope
+  if (!host.includes(':')) return null;
+
+  if (host.includes('.')) {
+    // Embedded IPv4 (::ffff:192.168.1.1) becomes two hex groups.
+    const lastColon = host.lastIndexOf(':');
+    const v4 = host.slice(lastColon + 1);
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v4);
+    if (!m) return null;
+    const [a, b, c, d] = m.slice(1).map(Number);
+    if ([a, b, c, d].some((n) => n > 255)) return null;
+    host = `${host.slice(0, lastColon)}:${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+
+  const halves = host.split('::');
+  if (halves.length > 2) return null;
+  const split = (part) => (part === '' ? [] : part.split(':'));
+  const head = split(halves[0]);
+  const tail = halves.length === 2 ? split(halves[1]) : [];
+  if ([...head, ...tail].some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return null;
+  if (halves.length === 1) {
+    return head.length === 8 ? head.map((group) => Number.parseInt(group, 16)) : null;
+  }
+  const missing = 8 - head.length - tail.length;
+  if (missing < 1) return null;
+  return [
+    ...head.map((group) => Number.parseInt(group, 16)),
+    ...new Array(missing).fill(0),
+    ...tail.map((group) => Number.parseInt(group, 16)),
+  ];
+}
+
+function isPrivateIPv6(host) {
+  const words = expandIPv6(host);
+  if (!words) return false;
+  // ::, ::1 and IPv4-mapped/compatible forms: judge the embedded IPv4.
+  if (words.slice(0, 5).every((word) => word === 0) && (words[5] === 0 || words[5] === 0xffff)) {
+    const v4 = `${words[6] >> 8}.${words[6] & 0xff}.${words[7] >> 8}.${words[7] & 0xff}`;
+    return isPrivateIPv4(v4);
+  }
+  if ((words[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+  if ((words[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((words[0] & 0xffc0) === 0xfec0) return true; // fec0::/10 site-local (deprecated)
+  return false;
+}
+
+export function isPrivateHost(hostname) {
+  const host = String(hostname ?? '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host) return false;
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
+  if (host.includes(':')) return isPrivateIPv6(host);
+  return isPrivateIPv4(host);
+}
+
+/**
+ * Resolve a URL hostname and reject private/loopback targets.
+ *
+ * Checking the hostname alone is not enough: a public DNS name can point at an
+ * internal address, which would let a page steer the fetch into a LAN or
+ * loopback service. Every resolved address is checked instead.
+ */
+export async function resolveHostAddresses(hostname) {
+  const host = String(hostname ?? '').replace(/^\[|\]$/g, '');
+  if (!host) throw new HttpError('BAD_URL', 'URL has no hostname.');
+
+  const family = isIP(host);
+  if (family) {
+    if (!ALLOW_PRIVATE && isPrivateHost(host)) {
+      throw new HttpError(
+        'PRIVATE_ADDRESS',
+        `Refusing to connect to the private/loopback address ${host}. ` +
+          'Set WEB_TOOLS_ALLOW_PRIVATE=1 to allow local addresses.',
+        { host },
+      );
+    }
+    return [{ address: host, family }];
+  }
+
+  if (!ALLOW_PRIVATE && isPrivateHost(host)) {
+    throw new HttpError(
+      'PRIVATE_ADDRESS',
+      `Refusing to connect to ${host}. Set WEB_TOOLS_ALLOW_PRIVATE=1 to allow local addresses.`,
+      { host },
+    );
+  }
+
+  let addresses;
+  try {
+    addresses = await dnsLookup(host, { all: true, verbatim: true });
+  } catch (err) {
+    const code = err?.code ?? 'DNS_ERROR';
+    throw new HttpError('DNS_FAILURE', `Could not resolve ${host} (${code}).`, { host });
+  }
+  if (!Array.isArray(addresses) || addresses.length === 0) {
+    throw new HttpError('DNS_FAILURE', `Could not resolve ${host} (no addresses returned).`, { host });
+  }
+
+  if (!ALLOW_PRIVATE) {
+    const blocked = addresses.find((entry) => isPrivateHost(entry.address));
+    if (blocked) {
+      throw new HttpError(
+        'PRIVATE_ADDRESS',
+        `Refusing to fetch ${host}: it resolves to the private/loopback address ${blocked.address}. ` +
+          'Set WEB_TOOLS_ALLOW_PRIVATE=1 to allow local addresses.',
+        { host, address: blocked.address },
+      );
+    }
+  }
+  return addresses;
+}
+
+/**
+ * A net lookup replacement that only returns addresses already validated by
+ * resolveHostAddresses. Pinning the connection to the checked addresses stops
+ * DNS rebinding between the check and the socket connect.
+ */
+export function pinnedLookup(addresses) {
+  const entries = addresses.map(({ address, family }) => ({ address, family }));
+  return (hostname, options, callback) => {
+    if (typeof options === 'function') {
+      callback = options;
+      options = {};
+    }
+    const family = Number(options?.family) || 0;
+    const candidates = family ? entries.filter((entry) => entry.family === family) : entries;
+    const list = candidates.length > 0 ? candidates : entries;
+    if (list.length === 0) {
+      callback(new Error(`No validated address for ${hostname}.`));
+      return;
+    }
+    if (options?.all) callback(null, list);
+    else callback(null, list[0].address, list[0].family);
+  };
+}
+
+function dispatcherFor(addresses) {
+  return new Agent({ connect: { lookup: pinnedLookup(addresses) } });
 }
 
 // Serialize request starts with a minimum interval.
@@ -324,8 +459,12 @@ export function classifyFetchError(err, url) {
   };
 }
 
-/** Whether the caller's robots policy permits fetching this URL. Fails open. */
-export async function robotsAllows(rawUrl) {
+/**
+ * Whether the caller's robots policy permits fetching this URL. Fails open.
+ * `addresses` must be the validated addresses of the URL's host, so the
+ * robots.txt request is pinned to the same target.
+ */
+export async function robotsAllows(rawUrl, addresses = null) {
   if (!RESPECT_ROBOTS) return true;
   let parsed;
   try {
@@ -336,15 +475,24 @@ export async function robotsAllows(rawUrl) {
   const origin = parsed.origin;
   if (!robotsCache.has(origin)) {
     let rules = [];
+    const agent = addresses ? dispatcherFor(addresses) : null;
     try {
       const res = await fetch(new URL('/robots.txt', origin), {
         headers: { 'User-Agent': USER_AGENT },
         signal: AbortSignal.timeout(8000),
+        ...(agent ? { dispatcher: agent } : {}),
       });
       // A missing or unreadable robots.txt means "no restrictions".
       if (res.ok) rules = parseRobotsTxt(await res.text());
+      else await res.body?.cancel();
     } catch {
       rules = [];
+    } finally {
+      try {
+        agent?.destroy();
+      } catch {
+        /* already gone */
+      }
     }
     robotsCache.set(origin, rules);
   }
@@ -361,12 +509,21 @@ async function readCapped(response, maxBytes) {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      chunks.push(value);
-      total += value.length;
-      if (total >= maxBytes) {
-        truncated = true;
+      if (total + value.length >= maxBytes) {
+        const take = Math.max(0, maxBytes - total);
+        if (take > 0) chunks.push(value.subarray(0, take));
+        total = maxBytes;
+        // Truncated only if the body really continued past the cap: a body of
+        // exactly maxBytes is complete, so peek for one more chunk first.
+        truncated = value.length > take;
+        if (!truncated) {
+          const next = await reader.read();
+          truncated = !next.done;
+        }
         break;
       }
+      chunks.push(value);
+      total += value.length;
     }
   } finally {
     try {
@@ -420,6 +577,7 @@ export async function httpGet(rawUrl, options = {}) {
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let activeAgent = null;
 
   try {
     let response = null;
@@ -429,16 +587,11 @@ export async function httpGet(rawUrl, options = {}) {
       }
       visited.add(current);
 
-      if (!ALLOW_PRIVATE && isPrivateHost(new URL(current).hostname)) {
-        throw new HttpError(
-          'PRIVATE_ADDRESS',
-          `Refusing to fetch the private/loopback address ${new URL(current).host}. ` +
-            'Set WEB_TOOLS_ALLOW_PRIVATE=1 to allow local addresses.',
-          { url: current },
-        );
-      }
+      // Resolve first and pin the connection to the checked addresses: a
+      // hostname check alone lets a public name point at an internal IP.
+      const addresses = await resolveHostAddresses(new URL(current).hostname);
 
-      if (!(await robotsAllows(current))) {
+      if (!(await robotsAllows(current, addresses))) {
         throw new HttpError(
           'ROBOTS_DISALLOWED',
           `robots.txt for ${new URL(current).origin} disallows ${new URL(current).pathname}. ` +
@@ -449,31 +602,50 @@ export async function httpGet(rawUrl, options = {}) {
 
       await throttle(throttleMs);
 
-      response = await fetchOnce(
-        current,
-        {
-          redirect: 'manual',
-          signal: controller.signal,
-          headers: {
-            'User-Agent': USER_AGENT,
-            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            ...headers,
-          },
-        },
-        start,
-      );
-
-      if (!REDIRECT_STATUS.has(response.status) || !followRedirects) break;
-
-      const location = response.headers.get('location');
+      const agent = dispatcherFor(addresses);
+      let hopResponse;
       try {
-        await response.body?.cancel();
+        hopResponse = await fetchOnce(
+          current,
+          {
+            redirect: 'manual',
+            signal: controller.signal,
+            dispatcher: agent,
+            headers: {
+              'User-Agent': USER_AGENT,
+              Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept-Encoding': 'gzip, deflate, br',
+              ...headers,
+            },
+          },
+          start,
+        );
+      } catch (err) {
+        agent.destroy();
+        throw err;
+      }
+
+      if (!REDIRECT_STATUS.has(hopResponse.status) || !followRedirects) {
+        response = hopResponse;
+        activeAgent = agent;
+        break;
+      }
+
+      const location = hopResponse.headers.get('location');
+      if (!location) {
+        // Redirect status without a target: treat as final.
+        response = hopResponse;
+        activeAgent = agent;
+        break;
+      }
+      try {
+        await hopResponse.body?.cancel();
       } catch {
         /* ignore */
       }
-      if (!location) break; // redirect status without a target: treat as final
+      agent.destroy();
+
       if (hop === MAX_REDIRECTS) {
         throw new HttpError('TOO_MANY_REDIRECTS', `Exceeded ${MAX_REDIRECTS} redirects`, {
           url: current,
@@ -485,7 +657,20 @@ export async function httpGet(rawUrl, options = {}) {
       }
     }
 
-    const { bytes, truncated } = await readCapped(response, maxBytes);
+    if (!response) {
+      throw new HttpError('REQUEST_FAILED', 'No response was received.', { url: current });
+    }
+
+    let bytes;
+    let truncated;
+    try {
+      ({ bytes, truncated } = await readCapped(response, maxBytes));
+    } catch (err) {
+      if (err?.name === 'AbortError' || err?.name === 'TimeoutError') {
+        throw new HttpError('TIMEOUT', `Request timed out after ${Date.now() - start}ms`, { url: current });
+      }
+      throw err;
+    }
     const contentType = response.headers.get('content-type') ?? '';
     const charset = sniffCharset(contentType, bytes);
 
@@ -500,6 +685,11 @@ export async function httpGet(rawUrl, options = {}) {
       elapsedMs: Date.now() - start,
     };
   } finally {
+    try {
+      activeAgent?.destroy();
+    } catch {
+      /* already gone */
+    }
     clearTimeout(timer);
   }
 }
@@ -515,19 +705,13 @@ export async function httpPost(rawUrl, body, options = {}) {
 
   const start = Date.now();
   const url = parseUrl(rawUrl);
-  if (!ALLOW_PRIVATE && isPrivateHost(url.hostname)) {
-    throw new HttpError(
-      'PRIVATE_ADDRESS',
-      `Refusing to POST to the private/loopback address ${url.host}. ` +
-        'Set WEB_TOOLS_ALLOW_PRIVATE=1 to allow local addresses.',
-      { url: url.href },
-    );
-  }
+  const addresses = await resolveHostAddresses(url.hostname);
 
   await throttle(throttleMs);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const agent = dispatcherFor(addresses);
 
   try {
     const response = await fetchOnce(
@@ -535,6 +719,7 @@ export async function httpPost(rawUrl, body, options = {}) {
       {
         method: 'POST',
         signal: controller.signal,
+        dispatcher: agent,
         headers: {
           'User-Agent': USER_AGENT,
           'Content-Type': 'application/json',
@@ -546,7 +731,16 @@ export async function httpPost(rawUrl, body, options = {}) {
       start,
     );
 
-    const { bytes, truncated } = await readCapped(response, maxBytes);
+    let bytes;
+    let truncated;
+    try {
+      ({ bytes, truncated } = await readCapped(response, maxBytes));
+    } catch (err) {
+      if (err?.name === 'AbortError' || err?.name === 'TimeoutError') {
+        throw new HttpError('TIMEOUT', `Request timed out after ${Date.now() - start}ms`, { url: url.href });
+      }
+      throw err;
+    }
     const contentType = response.headers.get('content-type') ?? '';
 
     return {
@@ -559,6 +753,11 @@ export async function httpPost(rawUrl, body, options = {}) {
       elapsedMs: Date.now() - start,
     };
   } finally {
+    try {
+      agent.destroy();
+    } catch {
+      /* already gone */
+    }
     clearTimeout(timer);
   }
 }

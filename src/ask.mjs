@@ -54,6 +54,27 @@ export function buildAskRequest(query, { research = false, country, language, ma
   return body;
 }
 
+/** Coerce a provider field that may be a number or a numeric string. */
+function numeric(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value.trim().replace(/^\$/, '').replace(/,/g, ''));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+/** Case-insensitive lookup of a cost header in the usage payload. */
+function costField(cost, name) {
+  if (!cost || typeof cost !== 'object') return undefined;
+  if (Object.hasOwn(cost, name)) return cost[name];
+  const wanted = name.toLowerCase();
+  for (const [key, value] of Object.entries(cost)) {
+    if (key.toLowerCase() === wanted) return value;
+  }
+  return undefined;
+}
+
 /** Concatenate delta.content across an SSE body. */
 export function parseSseContent(raw) {
   let text = '';
@@ -172,14 +193,17 @@ function researchSources(urls) {
   return out;
 }
 
-/** Turn a raw SSE body into the answer, sources and cost of one call. */
-export function parseAskStream(raw) {
+/**
+ * Turn a raw SSE body into the answer, sources and cost of one call.
+ * `research` comes from the request: both modes can stream an <answer> tag,
+ * so its presence does not identify the mode.
+ */
+export function parseAskStream(raw, { research = false } = {}) {
   const { text, usage, sawData } = parseSseContent(raw);
   if (!sawData) return null; // caller may still have a JSON body to try
 
   const payloads = (tag) => takeTagPayloads(text, tag).map(parseLenientJson).filter((v) => v != null);
   const answerTag = payloads('answer').pop() ?? null;
-  const research = answerTag !== null;
   const cost = payloads('usage').pop() ?? null;
   const progress = payloads('progress').pop() ?? null;
   const queries = payloads('queries')
@@ -187,10 +211,23 @@ export function parseAskStream(raw) {
     .filter((q) => typeof q === 'string' && q.trim());
   const blindspots = blindspotTexts(payloads('blindspots').pop() ?? null);
 
-  const { prose, citations } = extractCitations(text);
+  const { prose, citations: proseCitations } = extractCitations(text);
   const stripped = stripStructuredTags(prose).trim();
   const fromTag = typeof answerTag?.answer === 'string' ? answerTag.answer.trim() : '';
-  const answer = fromTag || stripped;
+
+  let answer = '';
+  let citations = proseCitations;
+  if (fromTag) {
+    // The tagged answer is authoritative, but it can carry citation and
+    // structured tags of its own; clean it before returning it.
+    const tagged = extractCitations(fromTag);
+    const cleaned = stripStructuredTags(tagged.prose).trim();
+    if (cleaned) {
+      answer = cleaned;
+      citations = [...proseCitations, ...tagged.citations];
+    }
+  }
+  if (!answer) answer = stripped;
 
   if (!answer) {
     throw new HttpError('ASK_UNPARSEABLE', 'Brave returned a stream with no answer text in it.');
@@ -258,7 +295,7 @@ export async function askBrave(query, options = {}) {
     if (res.status < 200 || res.status >= 300) throw askApiError(res.status, raw);
     if (res.truncated) throw new HttpError('ASK_UNPARSEABLE', 'Brave\'s answer stream exceeded the download size limit.');
 
-    const parsed = parseAskStream(raw) ?? parseJsonAnswer(raw);
+    const parsed = parseAskStream(raw, { research }) ?? parseJsonAnswer(raw, { research });
     return { ...parsed, elapsedMs: res.elapsedMs };
   } catch (err) {
     // Redact API credentials from error messages.
@@ -268,7 +305,7 @@ export async function askBrave(query, options = {}) {
 }
 
 /** Fallback for a server that ignores stream=true and answers in one JSON body. */
-function parseJsonAnswer(raw) {
+function parseJsonAnswer(raw, { research = false } = {}) {
   let data = null;
   try {
     data = JSON.parse(raw);
@@ -283,7 +320,7 @@ function parseJsonAnswer(raw) {
   const { prose, citations } = extractCitations(answer);
   return {
     answer: stripStructuredTags(prose).trim(),
-    research: false,
+    research,
     sources: citationSources(citations),
     blindspots: [],
     queries: [],
@@ -295,7 +332,8 @@ function parseJsonAnswer(raw) {
 }
 
 function money(value) {
-  return typeof value === 'number' && Number.isFinite(value) ? `$${value.toFixed(4)}` : null;
+  const amount = numeric(value);
+  return amount == null ? null : `$${amount.toFixed(4)}`;
 }
 
 function hostOf(url) {
@@ -311,25 +349,29 @@ export function formatAskAnswer(query, result) {
 
   const cost = result.cost ?? {};
   const parts = [
-    money(cost['X-Request-Queries-Cost']),
-    money(cost['X-Request-Tokens-In-Cost']),
-    money(cost['X-Request-Tokens-Out-Cost']),
+    money(costField(cost, 'X-Request-Queries-Cost')),
+    money(costField(cost, 'X-Request-Tokens-In-Cost')),
+    money(costField(cost, 'X-Request-Tokens-Out-Cost')),
   ].filter(Boolean);
-  const total = money(cost['X-Request-Total-Cost']);
+  const total = money(costField(cost, 'X-Request-Total-Cost'));
   if (total) lines.push(`Cost: ${total}${parts.length === 3 ? ` (query ${parts[0]} + input ${parts[1]} + output ${parts[2]})` : ''}`);
 
-  const tokensIn = cost['X-Request-Tokens-In'] ?? result.usage?.prompt_tokens;
-  const tokensOut = cost['X-Request-Tokens-Out'] ?? result.usage?.completion_tokens;
-  if (Number.isFinite(tokensIn) || Number.isFinite(tokensOut)) {
+  const tokensIn = numeric(costField(cost, 'X-Request-Tokens-In')) ?? numeric(result.usage?.prompt_tokens);
+  const tokensOut = numeric(costField(cost, 'X-Request-Tokens-Out')) ?? numeric(result.usage?.completion_tokens);
+  if (tokensIn != null || tokensOut != null) {
     lines.push(`Tokens: ${tokensIn ?? '?'} in / ${tokensOut ?? '?'} out`);
   }
 
   if (result.research && result.progress) {
     const p = result.progress;
-    const seconds = Number.isFinite(p.elasped_seconds) ? `${p.elasped_seconds.toFixed(1)}s` : '?';
+    const elapsed = numeric(p.elasped_seconds);
+    const seconds = elapsed == null ? '?' : `${elapsed.toFixed(1)}s`;
+    const iterations = numeric(p.number_of_iterations) ?? p.number_of_iterations ?? '?';
+    const queryCount = numeric(p.number_of_queries) ?? p.number_of_queries ?? '?';
+    const urls = numeric(p.number_of_urls_analyzed) ?? p.number_of_urls_analyzed ?? '?';
     lines.push(
-      `Research: ${seconds}, ${p.number_of_iterations ?? '?'} iteration(s), ` +
-        `${p.number_of_queries ?? '?'} query(ies), ${p.number_of_urls_analyzed ?? '?'} url(s) analyzed`,
+      `Research: ${seconds}, ${iterations} iteration(s), ` +
+        `${queryCount} query(ies), ${urls} url(s) analyzed`,
     );
   }
 

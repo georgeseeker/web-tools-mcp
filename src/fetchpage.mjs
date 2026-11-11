@@ -356,8 +356,9 @@ export function paginate(text, startIndex, maxLength) {
 
   let end = hardEnd;
   if (hardEnd < total) {
+    // Snapping may only end the chunk earlier; never let it exceed the limit.
     const snapped = avoidSplitPair(text, snapToParagraph(text, start, hardEnd));
-    if (snapped > start) end = snapped;
+    if (snapped > start) end = Math.min(snapped, hardEnd);
   }
 
   return { slice: text.slice(start, end), start, end, total, hasMore: end < total, remaining: total - end };

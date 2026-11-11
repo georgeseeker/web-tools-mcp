@@ -22,13 +22,22 @@ export function buildContextRequest(query, options = {}) {
   return body;
 }
 
-/** The page's date, from the API's four-slot age array (empty when unknown). */
+// Age arrays have varied in shape, so classify entries by content instead of
+// trusting slot positions. A dated entry names a year; a relative one does not.
+const RELATIVE_DATE = /\b(?:\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago|yesterday|today)\b/i;
+const DATED = /\b(?:19|20)\d{2}\b/;
+
+/** The page's date, from the API's age array (empty when unknown). */
 function pageDate(age) {
   if (!Array.isArray(age)) return '';
-  const day = typeof age[1] === 'string' ? age[1].trim() : '';
-  const relative = typeof age[2] === 'string' ? age[2].trim() : '';
-  if (day && relative) return `${day} (${relative})`;
-  return day || relative;
+  const entries = age
+    .filter((entry) => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const relative = entries.find((entry) => RELATIVE_DATE.test(entry)) ?? '';
+  const dated = entries.find((entry) => entry !== relative && DATED.test(entry)) ?? '';
+  if (dated && relative) return `${dated} (${relative})`;
+  return dated || relative || entries[0] || '';
 }
 
 export function parseContextResults(data) {

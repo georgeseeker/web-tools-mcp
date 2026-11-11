@@ -76,6 +76,8 @@ npm install
 
 HTML 转为 Markdown；文本、JSON、XML 直接返回。支持字符集识别，拒绝二进制内容。默认超时 30 秒、下载上限 10 MB、最多 5 次重定向，不执行页面 JavaScript。
 
+抓取前会解析域名并检查每一个解析结果：只要指向私网、回环或链路本地地址就拒绝，域名指向内网也拦得住。实际连接绑定在校验过的地址上，DNS 重绑定无法绕过；重定向的每一跳都重新校验。
+
 ## web_ask
 
 | 参数 | 说明 |
@@ -103,7 +105,7 @@ research 模式耗时可达时间预算上限，且客户端可能有工具调�
 | `BRAVE_SEARCH_API_KEY` | `web_search` 和 `web_context` 必需；`web_fetch` 无需 key |
 | `BRAVE_ASK_API_KEY` | `web_ask` 必需，Answers 套餐的 key，与搜索 key 分开 |
 | `WEB_TOOLS_RESPECT_ROBOTS` | `1` 时检查 robots.txt，默认关闭 |
-| `WEB_TOOLS_ALLOW_PRIVATE` | `1` 时允许访问私网和回环地址，默认关闭 |
+| `WEB_TOOLS_ALLOW_PRIVATE` | `1` 时允许访问私网和回环地址，默认关闭；默认会解析域名并检查所有地址 |
 
 ## 许可
 

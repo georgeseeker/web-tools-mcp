@@ -158,6 +158,40 @@ function requireNonEmptyString(value, field) {
   return null;
 }
 
+/** Read a numeric argument; reject wrong types instead of silently defaulting. */
+function readNumber(args, field, fallback) {
+  const raw = args[field];
+  if (raw === undefined || raw === null) return { value: fallback };
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+    return { error: `web-tools error: "${field}" must be a number.` };
+  }
+  return { value: raw };
+}
+
+/** Read a boolean argument; reject wrong types instead of silently defaulting. */
+function readBoolean(args, field, fallback) {
+  const raw = args[field];
+  if (raw === undefined || raw === null) return { value: fallback };
+  if (typeof raw !== 'boolean') {
+    return { error: `web-tools error: "${field}" must be true or false.` };
+  }
+  return { value: raw };
+}
+
+/** Read and trim a query, enforcing the limits the tool description states. */
+function readQuery(args, field, { maxChars, maxWords } = {}) {
+  const bad = requireNonEmptyString(args[field], field);
+  if (bad) return { error: bad };
+  const query = args[field].trim();
+  if (maxChars && query.length > maxChars) {
+    return { error: `web-tools error: "${field}" must be at most ${maxChars} characters.` };
+  }
+  if (maxWords && query.split(/\s+/).length > maxWords) {
+    return { error: `web-tools error: "${field}" must be at most ${maxWords} words.` };
+  }
+  return { value: query };
+}
+
 const server = new Server(
   { name: 'web', version: '0.1.0' },
   {
@@ -180,10 +214,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = request.params?.arguments ?? {};
   try {
     if (name === 'web_search') {
-      const bad = requireNonEmptyString(args.query, 'query');
-      if (bad) return textResult(bad, { isError: true });
+      const query = readQuery(args, 'query');
+      if (query.error) return textResult(query.error, { isError: true });
 
-      const count = Math.min(MAX_COUNT, Math.max(1, Number.isFinite(args.count) ? args.count : DEFAULT_COUNT));
+      const countArg = readNumber(args, 'count', DEFAULT_COUNT);
+      if (countArg.error) return textResult(countArg.error, { isError: true });
+      const count = Math.floor(Math.min(MAX_COUNT, Math.max(1, countArg.value)));
 
       for (const field of ['search_lang', 'country', 'freshness']) {
         if (args[field] !== undefined) {
@@ -193,30 +229,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
       }
-      const found = await searchBrave(args.query, { count, search_lang: args.search_lang, country: args.country, freshness: args.freshness });
-      return textResult(formatSearchResults(args.query, found, { count }));
+      const found = await searchBrave(query.value, { count, search_lang: args.search_lang, country: args.country, freshness: args.freshness });
+      return textResult(formatSearchResults(query.value, found, { count }));
     }
 
     if (name === 'web_fetch') {
       const bad = requireNonEmptyString(args.url, 'url');
       if (bad) return textResult(bad, { isError: true });
 
-      const maxLength = Number.isFinite(args.max_length)
-        ? Math.min(MAX_MAX_LENGTH, Math.max(1, args.max_length))
-        : DEFAULT_MAX_LENGTH;
-      const startIndex = Number.isFinite(args.start_index) ? Math.max(0, args.start_index) : 0;
+      const maxLengthArg = readNumber(args, 'max_length', DEFAULT_MAX_LENGTH);
+      if (maxLengthArg.error) return textResult(maxLengthArg.error, { isError: true });
+      const startArg = readNumber(args, 'start_index', 0);
+      if (startArg.error) return textResult(startArg.error, { isError: true });
+      const rawArg = readBoolean(args, 'raw', false);
+      if (rawArg.error) return textResult(rawArg.error, { isError: true });
+
+      const maxLength = Math.floor(Math.min(MAX_MAX_LENGTH, Math.max(1, maxLengthArg.value)));
+      const startIndex = Math.floor(Math.max(0, startArg.value));
 
       const result = await fetchPage(args.url, {
         maxLength,
         startIndex,
-        raw: args.raw === true,
+        raw: rawArg.value,
       });
       return textResult(formatFetchedPage(result));
     }
 
     if (name === 'web_ask') {
-      const bad = requireNonEmptyString(args.query, 'query');
-      if (bad) return textResult(bad, { isError: true });
+      const query = readQuery(args, 'query');
+      if (query.error) return textResult(query.error, { isError: true });
+
+      const researchArg = readBoolean(args, 'research', false);
+      if (researchArg.error) return textResult(researchArg.error, { isError: true });
+      const secondsArg = readNumber(args, 'research_seconds', undefined);
+      if (secondsArg.error) return textResult(secondsArg.error, { isError: true });
 
       for (const field of ['country', 'language']) {
         if (args[field] !== undefined) {
@@ -227,18 +273,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      const result = await askBrave(args.query, {
-        research: args.research === true,
-        researchSeconds: args.research_seconds,
+      const result = await askBrave(query.value, {
+        research: researchArg.value,
+        researchSeconds: secondsArg.value,
         country: args.country,
         language: args.language,
       });
-      return textResult(formatAskAnswer(args.query, result));
+      return textResult(formatAskAnswer(query.value, result));
     }
 
     if (name === 'web_context') {
-      const bad = requireNonEmptyString(args.query, 'query');
-      if (bad) return textResult(bad, { isError: true });
+      const query = readQuery(args, 'query', { maxChars: 400, maxWords: 50 });
+      if (query.error) return textResult(query.error, { isError: true });
 
       for (const field of ['country', 'search_lang', 'freshness']) {
         if (args[field] !== undefined) {
@@ -252,14 +298,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return textResult(`web-tools error: invalid "threshold". ${toolSchema('web_context').properties.threshold.description}`, { isError: true });
       }
 
-      const maxTokens = Number.isFinite(args.max_tokens)
-        ? Math.min(MAX_MAX_TOKENS, Math.max(MIN_MAX_TOKENS, Math.floor(args.max_tokens)))
-        : DEFAULT_MAX_TOKENS;
-      const maxUrls = Number.isFinite(args.max_urls)
-        ? Math.min(MAX_MAX_URLS, Math.max(1, Math.floor(args.max_urls)))
-        : DEFAULT_MAX_URLS;
+      const maxTokensArg = readNumber(args, 'max_tokens', DEFAULT_MAX_TOKENS);
+      if (maxTokensArg.error) return textResult(maxTokensArg.error, { isError: true });
+      const maxUrlsArg = readNumber(args, 'max_urls', DEFAULT_MAX_URLS);
+      if (maxUrlsArg.error) return textResult(maxUrlsArg.error, { isError: true });
 
-      const result = await fetchContext(args.query, {
+      const maxTokens = Math.min(MAX_MAX_TOKENS, Math.max(MIN_MAX_TOKENS, Math.floor(maxTokensArg.value)));
+      const maxUrls = Math.min(MAX_MAX_URLS, Math.max(1, Math.floor(maxUrlsArg.value)));
+
+      const result = await fetchContext(query.value, {
         maxTokens,
         maxUrls,
         threshold: args.threshold,
@@ -267,7 +314,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         searchLang: args.search_lang,
         freshness: args.freshness,
       });
-      return textResult(formatContext(args.query, result, { maxTokens }));
+      return textResult(formatContext(query.value, result, { maxTokens }));
     }
 
     return textResult(`web-tools error: unknown tool "${name}"`, { isError: true });
